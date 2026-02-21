@@ -1,18 +1,24 @@
+import asyncio
 import datetime
 import traceback
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Set
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 import astrbot.api.message_components as Comp
 
+# 发送失败时的最大重试次数
+MAX_RETRY = 3
+# 重试间隔基数（秒），实际间隔为 base * 2^(retry_count-1)
+RETRY_BASE_DELAY = 1.0
+
 
 @register(
     "astrbot_plugin_interflow",
     "RadicalSMP-devs",
     "跨平台群消息互通插件，支持创建消息池实现多群消息转发，支持自定义转发格式。",
-    "v0.1.0",
+    "v0.2.0",
 )
 class InterflowPlugin(Star):
     """Interflow - 群消息互通插件
@@ -124,6 +130,65 @@ class InterflowPlugin(Star):
 
         return media
 
+    def _build_chain(
+        self, formatted_text: str, media_components: List[Comp.BaseMessageComponent]
+    ) -> MessageChain:
+        """构建转发用的消息链：格式化文本 + 媒体附件"""
+        chain = MessageChain()
+        chain.message(formatted_text)
+
+        # 追加媒体消息段
+        for media_comp in media_components:
+            if isinstance(media_comp, Comp.Image):
+                # 优先使用 URL，其次使用文件路径
+                url = getattr(media_comp, "url", None) or getattr(
+                    media_comp, "file", None
+                )
+                if url:
+                    chain.image(url)
+            elif isinstance(media_comp, (Comp.File, Comp.Video, Comp.Record)):
+                # 文件、视频、语音直接追加到消息链
+                chain.chain.append(media_comp)
+
+        return chain
+
+    async def _send_with_retry(
+        self, target_umo: str, chain: MessageChain, pool_name: str
+    ):
+        """带重试机制的消息发送
+
+        使用指数退避策略，最多重试 MAX_RETRY 次。
+        针对 RuntimeError("Session is closed") 等瞬态错误进行重试。
+        """
+        last_exc = None
+        for attempt in range(1, MAX_RETRY + 1):
+            try:
+                await self.context.send_message(target_umo, chain)
+                return  # 发送成功，直接返回
+            except RuntimeError as e:
+                # 捕获 "Session is closed" 等运行时错误，这类错误通常是瞬态的
+                last_exc = e
+                if attempt < MAX_RETRY:
+                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"[Interflow] [{pool_name}] 发送到 {target_umo} 失败 "
+                        f"(第{attempt}次, {e}), {delay:.1f}s 后重试..."
+                    )
+                    await asyncio.sleep(delay)
+            except Exception as e:
+                # 非瞬态错误（如目标不存在、权限不足等），不重试
+                logger.warning(
+                    f"[Interflow] [{pool_name}] 发送到 {target_umo} 失败 (不可重试): "
+                    f"{e}"
+                )
+                return
+
+        # 重试耗尽仍然失败
+        logger.error(
+            f"[Interflow] [{pool_name}] 发送到 {target_umo} 在 {MAX_RETRY} 次重试后仍失败: "
+            f"{last_exc}"
+        )
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
         """监听所有群组消息，判断是否需要转发到消息池内的其他群组"""
@@ -160,6 +225,11 @@ class InterflowPlugin(Star):
             "[{platform} | {pool_name}] {sender_name}:\n{message}",
         )
 
+        # 记录已发送过的目标 UMO，避免同一条消息因多个消息池重复发送到同一目标
+        # 例如：群A 同时在池1和池2中，群B也同时在池1和池2中，
+        # 群A发消息时，群B 只需要收到一次转发即可
+        sent_targets: Set[str] = set()
+
         # 遍历该群组所属的所有消息池
         pools = self._umo_to_pools[source_umo]
         for pool in pools:
@@ -179,7 +249,7 @@ class InterflowPlugin(Star):
                     message_text=message_text,
                     timestamp=timestamp,
                 )
-            except (KeyError, ValueError) as e:
+            except (KeyError, ValueError, IndexError) as e:
                 logger.warning(
                     f"[Interflow] 消息池 '{pool_name}' 的转发格式模板有误: {e}，使用原始消息"
                 )
@@ -192,32 +262,14 @@ class InterflowPlugin(Star):
                 if target_umo == source_umo:
                     continue
 
-                try:
-                    # 构建转发消息链：格式化文本 + 媒体附件
-                    chain = MessageChain()
-                    chain.message(formatted_text)
+                # 去重：如果此目标已在其他消息池中被转发过，则跳过
+                if target_umo in sent_targets:
+                    continue
+                sent_targets.add(target_umo)
 
-                    # 追加媒体消息段
-                    for media_comp in media_components:
-                        if isinstance(media_comp, Comp.Image):
-                            # 优先使用 URL，其次使用文件路径
-                            url = getattr(media_comp, "url", None) or getattr(
-                                media_comp, "file", None
-                            )
-                            if url:
-                                chain.image(url)
-                        elif isinstance(
-                            media_comp, (Comp.File, Comp.Video, Comp.Record)
-                        ):
-                            # 文件、视频、语音直接追加到消息链
-                            chain.chain.append(media_comp)
-
-                    await self.context.send_message(target_umo, chain)
-
-                except Exception:
-                    logger.warning(
-                        f"[Interflow] 转发消息到 {target_umo} 失败:\n{traceback.format_exc()}"
-                    )
+                # 构建消息链并发送（带重试）
+                chain = self._build_chain(formatted_text, media_components)
+                await self._send_with_retry(target_umo, chain, pool_name)
 
         # 停止事件继续传播，避免消息被 LLM 等后续流程处理
         event.stop_event()
