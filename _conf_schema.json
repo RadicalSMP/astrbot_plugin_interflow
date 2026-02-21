@@ -1,0 +1,41 @@
+{
+  "default_format": {
+    "description": "默认转发格式模板",
+    "type": "text",
+    "hint": "当消息池未单独设置转发格式时，使用此默认格式。支持的变量: {sender_name} 发送者昵称, {sender_id} 发送者ID, {group_name} 源群组标识, {pool_name} 消息池名称, {platform} 来源平台, {message} 消息纯文本, {time} 时间(HH:MM:SS), {date} 日期(YYYY-MM-DD)",
+    "obvious_hint": true,
+    "default": "[{platform} | {pool_name}] {sender_name}:\n{message}"
+  },
+  "forward_image": {
+    "description": "是否转发图片",
+    "type": "bool",
+    "hint": "开启后，消息中的图片将被一并转发到其他群组",
+    "default": true
+  },
+  "forward_file": {
+    "description": "是否转发文件",
+    "type": "bool",
+    "hint": "开启后，消息中的文件将被一并转发到其他群组（部分平台可能不支持）",
+    "default": false
+  },
+  "forward_video": {
+    "description": "是否转发视频",
+    "type": "bool",
+    "hint": "开启后，消息中的视频将被一并转发到其他群组（部分平台可能不支持）",
+    "default": false
+  },
+  "forward_voice": {
+    "description": "是否转发语音",
+    "type": "bool",
+    "hint": "开启后，消息中的语音将被一并转发到其他群组（部分平台可能不支持）",
+    "default": false
+  },
+  "pools": {
+    "description": "消息池列表",
+    "type": "list",
+    "hint": "每个消息池包含若干群组，池内任意群组的消息会被转发到池内其他所有群组。请使用 JSON 数组格式配置，每个元素包含 name(名称), enabled(是否启用), format(转发格式,留空则使用默认格式), groups(群组的 unified_msg_origin 列表)。示例见 README。",
+    "default": [],
+    "editor_mode": true,
+    "editor_language": "json"
+  }
+}
